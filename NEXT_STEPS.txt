@@ -74,3 +74,41 @@ Files to look at first
 - streamlit_app.py
 - requirements.txt
 - .gitignore
+
+Latest roadmap update (June 2026)
+
+Product positioning
+- GRAppBuilder should be positioned as an app-builder helper with human-in-the-loop iteration.
+- One-shot generation is useful for scaffolding, but runtime fixes and refinement are expected.
+
+Primary user journeys to implement
+1. Quick prototype mode
+   - Goal: fastest idea-to-working-demo flow.
+   - Inputs: short prompt + optional API details.
+   - Outputs: file bundle preview + optional one-click push.
+   - UX: minimal controls, low friction, default settings.
+
+2. Production hardening mode
+   - Goal: improve reliability of generated apps before/after first deploy.
+   - Add a hardening pass that requests:
+     - Defensive error handling
+     - Session state safety checks
+     - Empty/null data guards
+     - Better API failure and timeout handling
+   - Include a smoke-test checklist the user can run quickly.
+
+Suggested hardening checklist
+1. Validate generated Python files compile cleanly.
+2. Verify requirements.txt includes needed dependencies only.
+3. Check secrets usage (no hardcoded keys or tokens).
+4. Verify API calls have timeout + error messages.
+5. Confirm empty state handling for forms/lists/tables.
+6. Test create/update/delete flow for generated app features.
+7. Add basic README run/deploy steps if missing.
+
+Near-term implementation order
+1. Add explicit mode selector: Quick prototype vs Production hardening.
+2. Implement AI hardening pass prompt + apply changes to generated bundle.
+3. Add post-generation smoke-test checklist UI.
+4. Add per-file edit-before-push capability.
+5. Add optional issue-fix loop: paste runtime error -> targeted patch generation.
