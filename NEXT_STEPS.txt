@@ -1,0 +1,76 @@
+GRAppBuilder - Next Steps
+
+Current state
+- Streamlit app deployed from this repo.
+- GitHub PAT authentication is implemented.
+- Repo creation is implemented.
+- Starter template support is implemented.
+- Current template: OpenWeather Streamlit app.
+- Generated repo includes starter files, requirements, README, and .streamlit/secrets.toml.example.
+
+Current user flow
+1. User opens GRAppBuilder.
+2. User authenticates with GitHub PAT.
+3. User creates a repo.
+4. User selects a starter template.
+5. App seeds the repo with starter files through the GitHub API.
+6. User adds secrets in Streamlit Community Cloud and deploys the generated app.
+
+Important notes
+- Keep secrets out of Git.
+- Streamlit Cloud secrets should be used for GITHUB_PAT and OPENWEATHER_API_KEY.
+- GetWeather1.txt contained a plain API key and is now gitignored.
+- That OpenWeather key should be rotated/regenerated if it is active.
+
+Recommended next implementation steps
+1. Add a post-repo workflow screen.
+   - After repo creation, guide the user into app-building options instead of stopping at the repo link.
+
+2. Expand template configuration.
+   - For weather app: app title, default city, metric vs imperial, forecast options, branding.
+
+3. Improve the template engine.
+   - Move from inline string generation to structured templates.
+   - Jinja2 is already in requirements and can be used later.
+
+4. Add more templates.
+   - Weather app
+   - Chat app
+   - Dashboard app
+   - Data collection/form app
+
+5. Add deployment guidance in-app.
+   - Show exact Streamlit secrets needed.
+   - Show the next deployment steps after repo generation.
+
+6. Add validation before pushing generated files.
+   - Basic syntax checks.
+   - Dependency sanity checks.
+   - Optional preview of generated files.
+
+7. Consider an AI Builder tab.
+   - User describes the app in plain English.
+   - Model returns a structured plan and file set.
+   - App validates output and pushes files to GitHub.
+   - Best approach: template-first, AI-assisted.
+
+AI builder architecture notes
+- The model should not directly control GitHub.
+- Safer flow:
+  1. User prompt
+  2. AI returns structured output
+  3. App validates output
+  4. App writes files to GitHub via API
+- This can work with OpenAI or Cohere.
+- Main concerns are cost, output quality, and validation.
+
+If resuming from here
+Start with:
+1. Add a dedicated app-builder step after repo creation.
+2. Turn the weather template into a configurable template.
+3. Add one more template to prove the pattern.
+
+Files to look at first
+- streamlit_app.py
+- requirements.txt
+- .gitignore
