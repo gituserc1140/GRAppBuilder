@@ -3,6 +3,7 @@ import requests
 import re
 import base64
 import json
+from urllib.parse import quote_plus
 
 st.set_page_config(page_title="GRAppBuilder", page_icon="🛠️", layout="centered")
 
@@ -88,6 +89,23 @@ def github_headers(token: str) -> dict[str, str]:
     }
 
 
+def build_streamlit_cloud_links(owner: str, repo_name: str, branch: str, app_file: str) -> dict[str, str]:
+    """Build Streamlit Community Cloud links for deploy and management."""
+    base_url = "https://share.streamlit.io"
+    repo_url = f"https://github.com/{owner}/{repo_name}"
+    deploy_url = (
+        f"{base_url}/deploy"
+        f"?repository={quote_plus(repo_url)}"
+        f"&branch={quote_plus(branch)}"
+        f"&mainModule={quote_plus(app_file)}"
+    )
+    return {
+        "cloud_home": base_url,
+        "deploy": deploy_url,
+        "repo": repo_url,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Auth UI
 # ---------------------------------------------------------------------------
@@ -152,6 +170,36 @@ with st.sidebar:
     st.caption(f"GITHUB_PAT: {github_status}")
     st.caption(f"COHERE_API_KEY: {cohere_status}")
     st.caption("Secret values are never displayed.")
+
+    st.divider()
+    st.markdown("**Deploy to Streamlit Cloud**")
+    default_sidebar_repo = st.session_state.get("last_created_repo", {}).get("name", "")
+    sidebar_repo = st.text_input(
+        "Repository name",
+        value=default_sidebar_repo,
+        key="sidebar_streamlit_repo",
+        placeholder="Example: GRAppBuilder",
+    )
+    sidebar_branch = st.text_input(
+        "Branch",
+        value="main",
+        key="sidebar_streamlit_branch",
+    )
+    sidebar_entry_file = st.text_input(
+        "App file",
+        value="streamlit_app.py",
+        key="sidebar_streamlit_entry_file",
+    )
+    if sidebar_repo.strip():
+        cloud_links = build_streamlit_cloud_links(
+            owner=user["login"],
+            repo_name=sidebar_repo.strip(),
+            branch=sidebar_branch.strip() or "main",
+            app_file=sidebar_entry_file.strip() or "streamlit_app.py",
+        )
+        st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
+        st.link_button("Deploy this repo", cloud_links["deploy"])
+        st.caption("After GitHub push, Streamlit apps on this branch typically auto-redeploy.")
 
 st.success(f"Connected to GitHub as **{user['login']}**")
 
@@ -1103,7 +1151,19 @@ with tab_ai:
                                 st.write(f"- {item}")
                         else:
                             st.success(f"Pushed {pushed_count} selected files successfully.")
-                            st.markdown(f"🔗 https://github.com/{user['login']}/{target_repo_name.strip()}")
+                            github_repo_url = f"https://github.com/{user['login']}/{target_repo_name.strip()}"
+                            st.markdown(f"🔗 {github_repo_url}")
+                            cloud_links = build_streamlit_cloud_links(
+                                owner=user["login"],
+                                repo_name=target_repo_name.strip(),
+                                branch="main",
+                                app_file="streamlit_app.py",
+                            )
+                            deploy_col1, deploy_col2 = st.columns(2)
+                            with deploy_col1:
+                                st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
+                            with deploy_col2:
+                                st.link_button("Deploy this repo", cloud_links["deploy"])
 
 with tab_review:
     st.divider()
@@ -1449,5 +1509,17 @@ with tab_patch:
                         else:
                             action = "Re-pushed" if repush_clicked else "Pushed"
                             st.success(f"{action} {pushed_count} patch files successfully.")
-                            st.markdown(f"🔗 https://github.com/{user['login']}/{patch_target_repo.strip()}")
+                            github_repo_url = f"https://github.com/{user['login']}/{patch_target_repo.strip()}"
+                            st.markdown(f"🔗 {github_repo_url}")
+                            cloud_links = build_streamlit_cloud_links(
+                                owner=user["login"],
+                                repo_name=patch_target_repo.strip(),
+                                branch="main",
+                                app_file="streamlit_app.py",
+                            )
+                            deploy_col1, deploy_col2 = st.columns(2)
+                            with deploy_col1:
+                                st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
+                            with deploy_col2:
+                                st.link_button("Deploy this repo", cloud_links["deploy"])
 
