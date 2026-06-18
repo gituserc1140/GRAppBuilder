@@ -517,6 +517,215 @@ def upsert_repo_file(
     return commit_repo_file(token, owner, repo_name, path, content, message, sha=sha)
 
 
+def list_user_repos(token: str) -> tuple[int, list[dict] | dict]:
+    """Return repositories accessible by the authenticated user."""
+    response = requests.get(
+        "https://api.github.com/user/repos",
+        headers=github_headers(token),
+        params={
+            "per_page": 100,
+            "sort": "updated",
+            "affiliation": "owner,collaborator,organization_member",
+        },
+        timeout=20,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"message": response.text}
+    return response.status_code, data
+
+
+def list_repo_branches(token: str, owner: str, repo_name: str) -> tuple[int, list[dict] | dict]:
+    """Return branches for a specific repository."""
+    response = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/branches",
+        headers=github_headers(token),
+        params={"per_page": 100},
+        timeout=20,
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = {"message": response.text}
+    return response.status_code, data
+
+
+def list_repo_files(token: str, owner: str, repo_name: str, branch: str) -> tuple[int, list[dict] | dict]:
+    """Return all tracked files for a branch using the git tree API."""
+    # Resolve branch to commit SHA.
+    branch_resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/branches/{branch}",
+        headers=github_headers(token),
+        timeout=20,
+    )
+    if branch_resp.status_code != 200:
+        try:
+            return branch_resp.status_code, branch_resp.json()
+        except ValueError:
+            return branch_resp.status_code, {"message": branch_resp.text}
+
+    commit_sha = branch_resp.json().get("commit", {}).get("sha")
+    if not commit_sha:
+        return 400, {"message": "Unable to resolve branch commit SHA."}
+
+    tree_resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/git/trees/{commit_sha}",
+        headers=github_headers(token),
+        params={"recursive": "1"},
+        timeout=30,
+    )
+    try:
+        data = tree_resp.json()
+    except ValueError:
+        data = {"message": tree_resp.text}
+
+    if tree_resp.status_code != 200:
+        return tree_resp.status_code, data
+
+    entries = data.get("tree", []) if isinstance(data, dict) else []
+    files = [
+        {
+            "path": item.get("path", ""),
+            "size": item.get("size", 0),
+        }
+        for item in entries
+        if isinstance(item, dict) and item.get("type") == "blob"
+    ]
+    return 200, files
+
+
+def get_repo_file_content(token: str, owner: str, repo_name: str, path: str, ref: str) -> tuple[bool, str]:
+    """Fetch and decode a text file from GitHub contents API."""
+    response = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}",
+        headers=github_headers(token),
+        params={"ref": ref},
+        timeout=25,
+    )
+    if response.status_code != 200:
+        try:
+            message = response.json().get("message", response.text)
+        except ValueError:
+            message = response.text
+        return False, f"{path}: {message}"
+
+    payload = response.json()
+    if payload.get("encoding") != "base64":
+        return False, f"{path}: unsupported encoding ({payload.get('encoding', 'unknown')})"
+
+    try:
+        decoded = base64.b64decode(payload.get("content", "")).decode("utf-8")
+    except Exception:
+        return False, f"{path}: file is not valid UTF-8 text"
+
+    return True, decoded
+
+
+def ask_cohere_for_repo_review(
+    api_key: str,
+    repo_full_name: str,
+    branch: str,
+    file_payload: list[dict[str, str]],
+    user_focus: str,
+) -> tuple[bool, str]:
+    """Ask Cohere to produce actionable code review and improvement suggestions."""
+    preamble = (
+        "You are a senior code reviewer and software architect. "
+        "Review the provided repository files and produce practical findings with severity. "
+        "Focus on bugs, reliability, security, maintainability, and missing tests. "
+        "Output in markdown with sections: Summary, Findings, Improvements, and Quick Wins. "
+        "Each finding should include: severity (High/Medium/Low), file path, issue, and suggested fix."
+    )
+
+    bundle = {
+        "repository": repo_full_name,
+        "branch": branch,
+        "focus": user_focus.strip() if user_focus.strip() else "General code quality and improvements",
+        "files": file_payload,
+    }
+
+    ok, payload_or_error = call_cohere_chat(
+        api_key=api_key,
+        payload={
+            "preamble": preamble,
+            "message": json.dumps(bundle),
+            "temperature": 0.2,
+        },
+        timeout=90,
+    )
+    if not ok:
+        return False, payload_or_error
+
+    return True, payload_or_error.get("text", "No response returned.")
+
+
+def ask_cohere_for_patch_bundle_from_review(
+    api_key: str,
+    repo_full_name: str,
+    branch: str,
+    review_report: str,
+    file_payload: list[dict[str, str]],
+) -> tuple[bool, str, dict | None]:
+    """Convert review suggestions into a patch-ready file bundle."""
+    preamble = (
+        "You are an expert software maintainer. "
+        "Use the provided review findings and current files to produce an updated file bundle. "
+        "Return only valid JSON with this exact shape: "
+        "{\"summary\": string, \"files\": [{\"path\": string, \"content\": string}], \"notes\": [string]}. "
+        "Do not include markdown fences or extra text. "
+        "Only include files that need changes."
+    )
+
+    message_payload = {
+        "repository": repo_full_name,
+        "branch": branch,
+        "instructions": "Apply the review recommendations and return a patch-ready updated file bundle.",
+        "review_report": review_report,
+        "current_files": file_payload,
+    }
+
+    ok, payload_or_error = call_cohere_chat(
+        api_key=api_key,
+        payload={
+            "preamble": preamble,
+            "message": json.dumps(message_payload),
+            "temperature": 0.1,
+        },
+        timeout=90,
+    )
+    if not ok:
+        return False, payload_or_error, None
+
+    output_text = payload_or_error.get("text", "")
+    parsed = extract_json_object(output_text)
+    if not parsed:
+        strict_message = (
+            "Rewrite the following into VALID JSON only with this shape: "
+            "{\"summary\": string, \"files\": [{\"path\": string, \"content\": string}], \"notes\": [string]}. "
+            "Do not include markdown fences or explanations.\n\n"
+            f"Content to convert:\n{output_text}"
+        )
+        retry_ok, retry_payload_or_error = call_cohere_chat(
+            api_key=api_key,
+            payload={
+                "preamble": "You are a strict JSON formatter.",
+                "message": strict_message,
+                "temperature": 0.0,
+            },
+            timeout=45,
+        )
+        if not retry_ok:
+            return False, retry_payload_or_error, None
+
+        repaired_text = retry_payload_or_error.get("text", "")
+        parsed = extract_json_object(repaired_text)
+        if not parsed:
+            return False, "Patch bundle output was not valid JSON after retry.", None
+
+    return True, "", parsed
+
+
 def seed_repo_template(
     token: str,
     owner: str,
@@ -547,7 +756,12 @@ def seed_repo_template(
     return True, ""
 
 
-tab_repo, tab_ai = st.tabs(["📁 Repo Builder", "🤖 AI Assistant"])
+tab_repo, tab_ai, tab_review, tab_patch = st.tabs([
+    "📁 Repo Builder",
+    "🤖 AI Assistant",
+    "🔎 Repo Review",
+    "🧩 Patch Bundle",
+])
 
 with tab_repo:
     st.divider()
@@ -890,4 +1104,350 @@ with tab_ai:
                         else:
                             st.success(f"Pushed {pushed_count} selected files successfully.")
                             st.markdown(f"🔗 https://github.com/{user['login']}/{target_repo_name.strip()}")
+
+with tab_review:
+    st.divider()
+    st.subheader("🔎 Repo Review and Improvement Suggestions")
+    st.caption("Select a GitHub repository, choose files, and get code review findings with improvement suggestions.")
+
+    review_api_key = get_cohere_api_key()
+    if not review_api_key:
+        st.warning("COHERE_API_KEY is required for AI review in this tab.")
+    else:
+        repos_key = "review_repo_cache"
+        if repos_key not in st.session_state:
+            st.session_state[repos_key] = []
+        if "review_last_report" not in st.session_state:
+            st.session_state["review_last_report"] = ""
+        if "review_last_file_payload" not in st.session_state:
+            st.session_state["review_last_file_payload"] = []
+        if "review_last_context" not in st.session_state:
+            st.session_state["review_last_context"] = {}
+        if "review_patch_bundle_state" not in st.session_state:
+            st.session_state["review_patch_bundle_state"] = None
+
+        col_refresh, col_hint = st.columns([1, 2])
+        with col_refresh:
+            if st.button("Refresh repo list", key="review_refresh_repos"):
+                with st.spinner("Loading repositories from GitHub..."):
+                    status_code, repos_data = list_user_repos(token)
+                if status_code == 200 and isinstance(repos_data, list):
+                    st.session_state[repos_key] = repos_data
+                else:
+                    message = repos_data.get("message", "Unknown error") if isinstance(repos_data, dict) else "Unknown error"
+                    st.error(f"Unable to load repositories: {message}")
+        with col_hint:
+            st.caption("Includes repos you own or can access through collaborations/organizations.")
+
+        if not st.session_state[repos_key]:
+            with st.spinner("Loading repositories from GitHub..."):
+                status_code, repos_data = list_user_repos(token)
+            if status_code == 200 and isinstance(repos_data, list):
+                st.session_state[repos_key] = repos_data
+            else:
+                message = repos_data.get("message", "Unknown error") if isinstance(repos_data, dict) else "Unknown error"
+                st.error(f"Unable to load repositories: {message}")
+
+        repos = st.session_state.get(repos_key, [])
+        if repos:
+            repo_label_map = {
+                f"{item['full_name']} ({'private' if item.get('private') else 'public'})": item
+                for item in repos
+                if isinstance(item, dict) and item.get("full_name")
+            }
+            repo_choice = st.selectbox(
+                "Repository",
+                options=list(repo_label_map.keys()),
+                key="review_repo_choice",
+            )
+            chosen_repo = repo_label_map[repo_choice]
+            owner = chosen_repo["owner"]["login"]
+            repo_name = chosen_repo["name"]
+            default_branch = chosen_repo.get("default_branch", "main")
+
+            branches_cache_key = f"review_branches_{owner}_{repo_name}"
+            if branches_cache_key not in st.session_state:
+                status_code, branches_data = list_repo_branches(token, owner, repo_name)
+                if status_code == 200 and isinstance(branches_data, list):
+                    st.session_state[branches_cache_key] = [b.get("name") for b in branches_data if b.get("name")]
+                else:
+                    st.session_state[branches_cache_key] = [default_branch]
+
+            branch_options = st.session_state.get(branches_cache_key, [default_branch])
+            selected_branch = st.selectbox(
+                "Branch",
+                options=branch_options,
+                index=branch_options.index(default_branch) if default_branch in branch_options else 0,
+                key="review_branch_choice",
+            )
+
+            files_cache_key = f"review_files_{owner}_{repo_name}_{selected_branch}"
+            file_col1, file_col2 = st.columns([1, 1])
+            with file_col1:
+                if st.button("Load files", key="review_load_files"):
+                    with st.spinner("Loading file list..."):
+                        status_code, files_data = list_repo_files(token, owner, repo_name, selected_branch)
+                    if status_code == 200 and isinstance(files_data, list):
+                        st.session_state[files_cache_key] = files_data
+                    else:
+                        message = files_data.get("message", "Unknown error") if isinstance(files_data, dict) else "Unknown error"
+                        st.error(f"Unable to load files: {message}")
+
+            with file_col2:
+                st.caption("Tip: select smaller sets of files for faster and better review quality.")
+
+            if files_cache_key not in st.session_state:
+                with st.spinner("Loading file list..."):
+                    status_code, files_data = list_repo_files(token, owner, repo_name, selected_branch)
+                if status_code == 200 and isinstance(files_data, list):
+                    st.session_state[files_cache_key] = files_data
+                else:
+                    st.session_state[files_cache_key] = []
+
+            repo_files = st.session_state.get(files_cache_key, [])
+            if repo_files:
+                text_like_files = [
+                    item for item in repo_files
+                    if isinstance(item, dict)
+                    and item.get("path")
+                    and not item.get("path", "").lower().endswith(
+                        (".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".zip", ".exe", ".woff", ".woff2")
+                    )
+                ]
+                all_paths = [item["path"] for item in text_like_files]
+                suggested_defaults = all_paths[: min(8, len(all_paths))]
+
+                selected_paths = st.multiselect(
+                    "Files to review",
+                    options=all_paths,
+                    default=suggested_defaults,
+                    key="review_selected_files",
+                )
+
+                focus_area = st.text_input(
+                    "Review focus (optional)",
+                    placeholder="Example: reliability, input validation, and maintainability",
+                    key="review_focus",
+                )
+                max_chars_per_file = st.slider(
+                    "Max characters per file",
+                    min_value=2000,
+                    max_value=30000,
+                    value=12000,
+                    step=1000,
+                    key="review_max_chars",
+                    help="Long files are truncated to keep review responses fast and useful.",
+                )
+
+                if st.button("Run AI code review", type="primary", key="review_run_button"):
+                    if not selected_paths:
+                        st.error("Select at least one file to review.")
+                    else:
+                        file_payload: list[dict[str, str]] = []
+                        skipped: list[str] = []
+                        with st.spinner("Fetching files from GitHub..."):
+                            for path in selected_paths:
+                                ok, content_or_error = get_repo_file_content(
+                                    token=token,
+                                    owner=owner,
+                                    repo_name=repo_name,
+                                    path=path,
+                                    ref=selected_branch,
+                                )
+                                if not ok:
+                                    skipped.append(content_or_error)
+                                    continue
+
+                                content = content_or_error
+                                truncated = False
+                                if len(content) > max_chars_per_file:
+                                    content = content[:max_chars_per_file]
+                                    truncated = True
+
+                                file_payload.append(
+                                    {
+                                        "path": path,
+                                        "content": content,
+                                        "truncated": "yes" if truncated else "no",
+                                    }
+                                )
+
+                        if not file_payload:
+                            st.error("No readable text files were available for review.")
+                            for item in skipped[:20]:
+                                st.write(f"- {item}")
+                        else:
+                            with st.spinner("Analyzing code with Cohere..."):
+                                ok, review_text = ask_cohere_for_repo_review(
+                                    api_key=review_api_key,
+                                    repo_full_name=f"{owner}/{repo_name}",
+                                    branch=selected_branch,
+                                    file_payload=file_payload,
+                                    user_focus=focus_area,
+                                )
+
+                            if not ok:
+                                st.error(review_text)
+                            else:
+                                st.session_state["review_last_report"] = review_text
+                                st.session_state["review_last_file_payload"] = file_payload
+                                st.session_state["review_last_context"] = {
+                                    "owner": owner,
+                                    "repo_name": repo_name,
+                                    "branch": selected_branch,
+                                }
+                                st.session_state["review_patch_bundle_state"] = None
+
+                            if skipped:
+                                st.warning("Some files were skipped:")
+                                for item in skipped[:20]:
+                                    st.write(f"- {item}")
+
+                latest_report = st.session_state.get("review_last_report", "")
+                latest_payload = st.session_state.get("review_last_file_payload", [])
+                latest_context = st.session_state.get("review_last_context", {})
+
+                if latest_report and latest_context.get("repo_name") == repo_name:
+                    st.markdown("### Review Report")
+                    st.markdown(latest_report)
+                    st.info("Next step: open the 🧩 Patch Bundle tab to convert this review into a patch-ready bundle and push/re-push changes.")
+            else:
+                st.info("No files found for this repository and branch.")
+
+with tab_patch:
+    st.divider()
+    st.subheader("🧩 Patch Bundle and Re-Push")
+    st.caption("Convert the latest review report into a patch-ready bundle, preview changes, and push/re-push to GitHub.")
+
+    patch_api_key = get_cohere_api_key()
+    if not patch_api_key:
+        st.warning("COHERE_API_KEY is required for patch bundle generation.")
+    else:
+        latest_report = st.session_state.get("review_last_report", "")
+        latest_payload = st.session_state.get("review_last_file_payload", [])
+        latest_context = st.session_state.get("review_last_context", {})
+
+        if not latest_report or not latest_payload or not latest_context:
+            st.info("No review data found yet. Run a code review first in the 🔎 Repo Review tab.")
+        else:
+            active_owner = latest_context.get("owner", "")
+            active_repo = latest_context.get("repo_name", "")
+            active_branch = latest_context.get("branch", "main")
+            st.caption(f"Using latest review context: {active_owner}/{active_repo} ({active_branch})")
+
+            if st.button("Convert suggestions to patch-ready bundle", key="patch_convert_bundle"):
+                with st.spinner("Generating patch-ready file bundle..."):
+                    ok, error_msg, patch_bundle = ask_cohere_for_patch_bundle_from_review(
+                        api_key=patch_api_key,
+                        repo_full_name=f"{active_owner}/{active_repo}",
+                        branch=active_branch,
+                        review_report=latest_report,
+                        file_payload=latest_payload,
+                    )
+
+                if not ok or not patch_bundle:
+                    st.error(error_msg)
+                else:
+                    validation_errors = validate_generated_bundle(patch_bundle)
+                    st.session_state["review_patch_bundle_state"] = {
+                        "bundle": patch_bundle,
+                        "validation_errors": validation_errors,
+                        "repo_name": active_repo,
+                    }
+
+            patch_state = st.session_state.get("review_patch_bundle_state")
+            if patch_state and patch_state.get("repo_name") == active_repo:
+                patch_bundle = patch_state["bundle"]
+                patch_errors = patch_state["validation_errors"]
+
+                st.markdown("### Patch-Ready Bundle")
+                patch_summary = patch_bundle.get("summary", "")
+                if patch_summary:
+                    st.markdown(patch_summary)
+
+                if patch_errors:
+                    st.error("Patch bundle validation failed:")
+                    for item in patch_errors:
+                        st.write(f"- {item}")
+                else:
+                    st.success("Patch bundle validation passed.")
+
+                patch_files = patch_bundle.get("files", [])
+                patch_paths = [item.get("path", "") for item in patch_files if item.get("path")]
+                patch_selection_key = "review_patch_selected_paths"
+                saved_patch_selection = st.session_state.get(patch_selection_key)
+                if not isinstance(saved_patch_selection, list) or set(saved_patch_selection) != set(patch_paths):
+                    st.session_state[patch_selection_key] = patch_paths.copy()
+
+                patch_selected_paths = st.multiselect(
+                    "Patch files to push",
+                    options=patch_paths,
+                    default=st.session_state.get(patch_selection_key, patch_paths.copy()),
+                    key="review_patch_selected_paths_widget",
+                )
+                st.session_state[patch_selection_key] = patch_selected_paths
+
+                for file_item in patch_files:
+                    path = file_item.get("path", "")
+                    content = file_item.get("content", "")
+                    with st.expander(f"Patch preview: {path}", expanded=False):
+                        st.code(content, language="python" if path.endswith(".py") else None)
+
+                st.markdown("### Push or Re-Push Patch Bundle")
+                patch_target_repo = st.text_input(
+                    "Target repository name",
+                    value=active_repo,
+                    key="review_patch_target_repo",
+                )
+                patch_commit_message = st.text_input(
+                    "Commit message",
+                    value="Apply AI review improvements",
+                    key="review_patch_commit_message",
+                )
+
+                push_col1, push_col2 = st.columns(2)
+                with push_col1:
+                    push_clicked = st.button("Push patch bundle", key="review_push_patch")
+                with push_col2:
+                    repush_clicked = st.button("Re-push last patch", key="review_repush_patch")
+
+                if push_clicked or repush_clicked:
+                    if patch_errors:
+                        st.error("Cannot push while validation errors exist.")
+                    elif not patch_selected_paths:
+                        st.error("Select at least one patch file to push.")
+                    elif not patch_target_repo.strip():
+                        st.error("Please enter a target repository name.")
+                    elif not repo_exists(token, user["login"], patch_target_repo.strip()):
+                        st.error("Target repository was not found under your account.")
+                    else:
+                        failed_paths: list[str] = []
+                        pushed_count = 0
+                        with st.spinner("Pushing patch bundle to GitHub..."):
+                            for file_item in patch_files:
+                                path = file_item.get("path", "")
+                                content = file_item.get("content", "")
+                                if path not in patch_selected_paths:
+                                    continue
+                                status_code, result = upsert_repo_file(
+                                    token=token,
+                                    owner=user["login"],
+                                    repo_name=patch_target_repo.strip(),
+                                    path=path,
+                                    content=content,
+                                    message=patch_commit_message.strip() or "Apply AI review improvements",
+                                )
+                                if status_code not in (200, 201):
+                                    failed_paths.append(f"{path}: {result.get('message', 'unknown error')}")
+                                else:
+                                    pushed_count += 1
+
+                        if failed_paths:
+                            st.error("Some patch files failed to push:")
+                            for item in failed_paths:
+                                st.write(f"- {item}")
+                        else:
+                            action = "Re-pushed" if repush_clicked else "Pushed"
+                            st.success(f"{action} {pushed_count} patch files successfully.")
+                            st.markdown(f"🔗 https://github.com/{user['login']}/{patch_target_repo.strip()}")
 
