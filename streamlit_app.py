@@ -106,6 +106,52 @@ def build_streamlit_cloud_links(owner: str, repo_name: str, branch: str, app_fil
     }
 
 
+def render_streamlit_cloud_buttons(cloud_links: dict[str, str]) -> None:
+    """Render Streamlit Cloud action buttons in a consistent layout."""
+    deploy_col1, deploy_col2 = st.columns(2)
+    with deploy_col1:
+        st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
+    with deploy_col2:
+        st.link_button("Deploy this repo", cloud_links["deploy"])
+
+
+def render_post_push_deploy_controls(
+    owner: str,
+    repo_name: str,
+    selected_paths: list[str],
+    branch_key: str,
+    app_file_key: str,
+) -> None:
+    """Render branch/app inputs and Streamlit Cloud deploy links after a push."""
+    preferred_app_file = "streamlit_app.py"
+    py_files = [path for path in selected_paths if path.endswith(".py")]
+    for candidate in ["streamlit_app.py", "app.py", "main.py"]:
+        if candidate in selected_paths:
+            preferred_app_file = candidate
+            break
+    else:
+        if py_files:
+            preferred_app_file = py_files[0]
+
+    deploy_branch = st.text_input(
+        "Deploy branch",
+        value="main",
+        key=branch_key,
+    )
+    deploy_app_file = st.text_input(
+        "Deploy app file",
+        value=preferred_app_file,
+        key=app_file_key,
+    )
+    cloud_links = build_streamlit_cloud_links(
+        owner=owner,
+        repo_name=repo_name,
+        branch=deploy_branch.strip() or "main",
+        app_file=deploy_app_file.strip() or "streamlit_app.py",
+    )
+    render_streamlit_cloud_buttons(cloud_links)
+
+
 # ---------------------------------------------------------------------------
 # Auth UI
 # ---------------------------------------------------------------------------
@@ -197,8 +243,7 @@ with st.sidebar:
             branch=sidebar_branch.strip() or "main",
             app_file=sidebar_entry_file.strip() or "streamlit_app.py",
         )
-        st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
-        st.link_button("Deploy this repo", cloud_links["deploy"])
+        render_streamlit_cloud_buttons(cloud_links)
         st.caption("After GitHub push, Streamlit apps on this branch typically auto-redeploy.")
 
 st.success(f"Connected to GitHub as **{user['login']}**")
@@ -1153,17 +1198,13 @@ with tab_ai:
                             st.success(f"Pushed {pushed_count} selected files successfully.")
                             github_repo_url = f"https://github.com/{user['login']}/{target_repo_name.strip()}"
                             st.markdown(f"🔗 {github_repo_url}")
-                            cloud_links = build_streamlit_cloud_links(
+                            render_post_push_deploy_controls(
                                 owner=user["login"],
                                 repo_name=target_repo_name.strip(),
-                                branch="main",
-                                app_file="streamlit_app.py",
+                                selected_paths=selected_paths,
+                                branch_key="ai_post_push_deploy_branch",
+                                app_file_key="ai_post_push_deploy_app_file",
                             )
-                            deploy_col1, deploy_col2 = st.columns(2)
-                            with deploy_col1:
-                                st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
-                            with deploy_col2:
-                                st.link_button("Deploy this repo", cloud_links["deploy"])
 
 with tab_review:
     st.divider()
@@ -1511,15 +1552,11 @@ with tab_patch:
                             st.success(f"{action} {pushed_count} patch files successfully.")
                             github_repo_url = f"https://github.com/{user['login']}/{patch_target_repo.strip()}"
                             st.markdown(f"🔗 {github_repo_url}")
-                            cloud_links = build_streamlit_cloud_links(
+                            render_post_push_deploy_controls(
                                 owner=user["login"],
                                 repo_name=patch_target_repo.strip(),
-                                branch="main",
-                                app_file="streamlit_app.py",
+                                selected_paths=patch_selected_paths,
+                                branch_key="patch_post_push_deploy_branch",
+                                app_file_key="patch_post_push_deploy_app_file",
                             )
-                            deploy_col1, deploy_col2 = st.columns(2)
-                            with deploy_col1:
-                                st.link_button("Open Streamlit Cloud", cloud_links["cloud_home"])
-                            with deploy_col2:
-                                st.link_button("Deploy this repo", cloud_links["deploy"])
 
